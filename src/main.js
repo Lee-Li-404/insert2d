@@ -8,7 +8,6 @@ scene.background = new THREE.Color(0x000000);
 const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 10);
 camera.position.z = 1;
 
-// 环境光
 scene.add(new THREE.AmbientLight(0xffffff, 10));
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -29,8 +28,20 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
-// === Hexagon geometry ===
+// === Globals ===
+let exploded = true; // 反转：默认就是方块形态
+let squareBlocks = []; // 每个小球对应的方块
+const SQUARE_SIZE = 0.15; // 方块边长
+const BALL_RADIUS = 0.015;
+
+const center = new THREE.Vector3(0, 0, 0);
+const balls = []; // { mesh, color, vel, state, containerMesh?, bounds? }
+
 const HEX_RADIUS = 0.28;
+let hexMesh = null;
+let backMesh = null;
+
+// === Build hex geometry (for later) ===
 function buildHexShape(radius) {
   const shape = new THREE.Shape();
   for (let i = 0; i < 6; i++) {
@@ -46,7 +57,35 @@ function buildHexShape(radius) {
 const hexShape = buildHexShape(HEX_RADIUS);
 const hexGeo = new THREE.ShapeGeometry(hexShape);
 
-// === Glass shader ===
+// === Hex collision data ===
+const hexVerts = [];
+for (let i = 0; i < 6; i++) {
+  const a = (i / 6) * Math.PI * 2;
+  hexVerts.push(
+    new THREE.Vector2(Math.cos(a) * HEX_RADIUS, Math.sin(a) * HEX_RADIUS)
+  );
+}
+function pointInConvexPolygon(p) {
+  for (let i = 0; i < 6; i++) {
+    const a = hexVerts[i],
+      b = hexVerts[(i + 1) % 6];
+    const ab = new THREE.Vector2(b.x - a.x, b.y - a.y);
+    const ap = new THREE.Vector2(p.x - a.x, p.y - a.y);
+    if (ab.x * ap.y - ab.y * ap.x < 0) return false;
+  }
+  return true;
+}
+
+function pointInSquare(localPos, halfSize) {
+  return (
+    localPos.x >= -halfSize &&
+    localPos.x <= halfSize &&
+    localPos.y >= -halfSize &&
+    localPos.y <= halfSize
+  );
+}
+
+// === Glass shader (shared) ===
 const MAX_LIGHTS = 20;
 const glassUniforms = {
   uLightCount: { value: 0 },
@@ -119,218 +158,289 @@ const glassMat = new THREE.ShaderMaterial({
   `,
 });
 
-const hexMesh = new THREE.Mesh(hexGeo, glassMat);
-scene.add(hexMesh);
-
-// 背板
+// 背板材质
 const backMat = new THREE.MeshBasicMaterial({ color: 0x0c0c0c });
-const backMesh = new THREE.Mesh(hexGeo, backMat);
-backMesh.position.z = -0.01;
-scene.add(backMesh);
 
-// === Hex collision data ===
-const hexVerts = [];
-for (let i = 0; i < 6; i++) {
-  const a = (i / 6) * Math.PI * 2;
-  hexVerts.push(
-    new THREE.Vector2(Math.cos(a) * HEX_RADIUS, Math.sin(a) * HEX_RADIUS)
-  );
-}
-function pointInConvexPolygon(p) {
-  for (let i = 0; i < 6; i++) {
-    const a = hexVerts[i],
-      b = hexVerts[(i + 1) % 6];
-    const ab = new THREE.Vector2(b.x - a.x, b.y - a.y);
-    const ap = new THREE.Vector2(p.x - a.x, p.y - a.y);
-    if (ab.x * ap.y - ab.y * ap.x < 0) return false;
-  }
-  return true;
+// === Helpers ===
+function ringLayout(i, count, radius = 0.55) {
+  const angle = (i / Math.max(1, count)) * Math.PI * 2;
+  return new THREE.Vector2(Math.cos(angle) * radius, Math.sin(angle) * radius);
 }
 
-// === Balls ===
-const BALL_RADIUS = 0.03;
-const center = new THREE.Vector3(0, 0, 0);
-const balls = [];
+// === 方块形态：新增「方块 + 小球」一对 ===
+function addSquareBallPair() {
+  const i = balls.length;
+  const p = ringLayout(i, i + 1);
 
-function spawnBall() {
-  const side = Math.random() < 0.5 ? -0.6 : 0.6;
-  const y = (Math.random() - 0.5) * 1;
+  // 球
   const color = new THREE.Color().setHSL(Math.random(), 0.75, 0.55);
-  const mat = new THREE.MeshBasicMaterial({ color });
-  const mesh = new THREE.Mesh(new THREE.CircleGeometry(BALL_RADIUS, 32), mat);
-  mesh.position.set(side, y, -0.01);
-  scene.add(mesh);
-  balls.push({
-    mesh,
+  const matBall = new THREE.MeshBasicMaterial({ color });
+  const meshBall = new THREE.Mesh(
+    new THREE.CircleGeometry(BALL_RADIUS, 32),
+    matBall
+  );
+  meshBall.position.set(p.x, p.y, -0.01);
+  scene.add(meshBall);
+
+  const ball = {
+    mesh: meshBall,
     color,
-    trapped: false,
     vel: new THREE.Vector2(),
-    state: "OUTSIDE",
+    state: "INSIDE",
+  };
+  balls.push(ball);
+
+  // 这个球的专属方块（克隆 shader + 半径更小）
+  const mat = glassMat.clone();
+  mat.uniforms = THREE.UniformsUtils.clone(glassMat.uniforms);
+  mat.uniforms.uLightCount.value = 1;
+  mat.uniforms.uLightPos.value[0] = new THREE.Vector2(p.x, p.y);
+  mat.uniforms.uLightColor.value[0] = color.clone();
+  mat.uniforms.uRadiusWorld.value = 0.2; // 方块形态：更紧的光斑
+  mat.uniforms.uIntensity.value = 0.9;
+
+  const meshSquare = new THREE.Mesh(
+    new THREE.PlaneGeometry(SQUARE_SIZE, SQUARE_SIZE),
+    mat
+  );
+  meshSquare.position.set(p.x, p.y, 0);
+  scene.add(meshSquare);
+
+  squareBlocks.push(meshSquare);
+
+  // 绑定关系
+  ball.containerMesh = meshSquare;
+  ball.bounds = SQUARE_SIZE * 0.5;
+
+  // 小弹入动效
+  gsap.from(meshSquare.scale, {
+    x: 0.01,
+    y: 0.01,
+    duration: 0.4,
+    ease: "back.out(1.7)",
+  });
+  gsap.from(meshBall.scale, {
+    x: 0.01,
+    y: 0.01,
+    duration: 0.4,
+    ease: "back.out(1.7)",
   });
 }
 
-// === Snapshot logic ===
-function snapshotAndExplodeHexTriangles({ uvInset = 0.08 } = {}) {
-  // 1) 暂时隐藏小球，避免拍进贴图（光效仍通过 uniforms 保留）
-  balls.forEach((b) => (b.mesh.visible = false));
-
-  // 2) 把当前场景渲染到 RT（用主 camera，保持和屏幕一致）
-  const rt = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight);
-  rt.texture.colorSpace = THREE.SRGBColorSpace;
-  renderer.setRenderTarget(rt);
-  renderer.render(scene, camera);
-  renderer.setRenderTarget(null);
-
-  // 3) 恢复小球
-  balls.forEach((b) => (b.mesh.visible = true));
-
-  // 4) 先算出六边形的世界顶点（别急着移除 hexMesh）
-  const hexWorldVerts = [];
-  for (let i = 0; i < 6; i++) {
-    const a = (i / 6) * Math.PI * 2;
-    const local = new THREE.Vector3(
-      Math.cos(a) * HEX_RADIUS,
-      Math.sin(a) * HEX_RADIUS,
-      0
-    );
-    const world = local.clone().applyMatrix4(hexMesh.matrixWorld);
-    hexWorldVerts.push(world);
+// === 六边形形态：组装 hex + 背板 ===
+function ensureHexMeshes() {
+  if (!hexMesh) {
+    hexMesh = new THREE.Mesh(hexGeo, glassMat);
   }
-  const centerWorld = new THREE.Vector3(0, 0, 0).applyMatrix4(
-    hexMesh.matrixWorld
-  );
+  if (!backMesh) {
+    backMesh = new THREE.Mesh(hexGeo, backMat);
+    backMesh.position.z = -0.01;
+  }
+}
 
-  // 5) 用主相机把世界点投到屏幕 UV（[0,1]）
-  const worldToUv = (v3) => {
-    const p = v3.clone().project(camera); // NDC [-1,1]
-    return new THREE.Vector2((p.x + 1) * 0.5, (p.y + 1) * 0.5); // UV [0,1]
-  };
+// === 从“方块形态”聚拢到“六边形形态” ===
+function gatherToHex() {
+  if (!exploded) return;
+  exploded = false;
 
-  // 6) 共享一个 snapshot 材质（所有碎片共用同一张贴图）
-  const sharedMat = new THREE.MeshBasicMaterial({
-    map: rt.texture,
-    transparent: true,
-    side: THREE.DoubleSide,
+  ensureHexMeshes();
+
+  // 将 hex 先放入场景但透明，待收拢完成淡入（可选）
+  if (!scene.children.includes(hexMesh)) scene.add(hexMesh);
+  if (!scene.children.includes(backMesh)) scene.add(backMesh);
+
+  // 回收动画：所有方块 & 球往中心收拢
+  const tl = gsap.timeline({
+    onComplete: () => {
+      // 收拢后移除所有方块
+      squareBlocks.forEach((sq) => {
+        sq.geometry.dispose();
+        sq.material.dispose();
+        scene.remove(sq);
+      });
+      squareBlocks = [];
+
+      // 六边形参数恢复
+      glassUniforms.uRadiusWorld.value = 0.5;
+      glassUniforms.uIntensity.value = 0.75;
+    },
   });
 
-  // 7) 准备爆裂：移除原 hex / 背板
+  for (const b of balls) {
+    if (b.containerMesh) {
+      const sq = b.containerMesh;
+      tl.to(
+        sq.position,
+        { x: 0, y: 0, duration: 0.8, ease: "power2.inOut" },
+        0
+      );
+      tl.to(
+        b.mesh.position,
+        { x: 0, y: 0, duration: 0.8, ease: "power2.inOut" },
+        0
+      );
+
+      // 解绑容器（进入六边形形态）
+      b.containerMesh = null;
+      b.bounds = null;
+    }
+    // 设为 OUTSIDE，进入六边形后会被吸入
+    b.state = "OUTSIDE";
+  }
+}
+
+// === 从“六边形形态”炸回“方块形态” ===
+function explodeFromHex() {
+  if (exploded) return;
+  exploded = true;
+
+  // 从场景移除六边形
   if (hexMesh) scene.remove(hexMesh);
   if (backMesh) scene.remove(backMesh);
 
-  // 8) 生成 6 片三角碎片（中心 + 邻边两个顶点），UV 用屏幕 UV，并做内缩
-  const fragments = [];
-  for (let i = 0; i < 6; i++) {
-    const w1 = centerWorld; // 世界坐标
-    const w2 = hexWorldVerts[i];
-    const w3 = hexWorldVerts[(i + 1) % 6];
+  // 为每个球创建对等方块并飞散
+  squareBlocks = [];
+  balls.forEach((ball, i) => {
+    const p = ringLayout(i, balls.length);
 
-    // 顶点位置：把碎片直接放在世界坐标原位
-    const positions = new Float32Array([
-      w1.x,
-      w1.y,
-      w1.z,
-      w2.x,
-      w2.y,
-      w2.z,
-      w3.x,
-      w3.y,
-      w3.z,
-    ]);
+    // 方块
+    const mat = glassMat.clone();
+    mat.uniforms = THREE.UniformsUtils.clone(glassMat.uniforms);
+    mat.uniforms.uLightCount.value = 1;
+    mat.uniforms.uLightPos.value[0] = new THREE.Vector2(
+      ball.mesh.position.x,
+      ball.mesh.position.y
+    );
+    mat.uniforms.uLightColor.value[0] = ball.color.clone();
+    mat.uniforms.uRadiusWorld.value = 0.2;
+    mat.uniforms.uIntensity.value = 0.9;
 
-    // 屏幕 UV（对应 snapshot）
-    const uv1 = worldToUv(w1);
-    const uv2 = worldToUv(w2);
-    const uv3 = worldToUv(w3);
+    const sq = new THREE.Mesh(
+      new THREE.PlaneGeometry(SQUARE_SIZE, SQUARE_SIZE),
+      mat
+    );
+    sq.position.set(0, 0, 0);
+    scene.add(sq);
+    squareBlocks.push(sq);
 
-    // UV 内缩（留边距，防止边界采样到外面背景/发黑）
-    const cx = (uv1.x + uv2.x + uv3.x) / 3;
-    const cy = (uv1.y + uv2.y + uv3.y) / 3;
-    const inset = (uv, k) =>
-      new THREE.Vector2(cx + (uv.x - cx) * (1 - k), cy + (uv.y - cy) * (1 - k));
-    const uv1i = inset(uv1, uvInset);
-    const uv2i = inset(uv2, uvInset);
-    const uv3i = inset(uv3, uvInset);
+    // 绑定
+    ball.containerMesh = sq;
+    ball.bounds = SQUARE_SIZE * 0.5;
+    ball.state = "INSIDE";
 
-    const uvs = new Float32Array([
-      uv1i.x,
-      uv1i.y,
-      uv2i.x,
-      uv2i.y,
-      uv3i.x,
-      uv3i.y,
-    ]);
-
-    // 真·三角面（填满）
-    const triGeo = new THREE.BufferGeometry();
-    triGeo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    triGeo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
-    triGeo.setIndex([0, 1, 2]);
-
-    const triMesh = new THREE.Mesh(triGeo, sharedMat);
-    scene.add(triMesh);
-    fragments.push(triMesh);
-  }
-
-  // 9) 爆裂动画（可选）
-  fragments.forEach((frag, i) => {
-    const angle = (i / fragments.length) * Math.PI * 2;
-    const r = 0.65;
-    const tx = Math.cos(angle) * r;
-    const ty = Math.sin(angle) * r;
-
-    if (typeof gsap !== "undefined") {
-      gsap.to(frag.position, {
-        x: tx,
-        y: ty,
-        duration: 1.1,
-        ease: "power2.out",
-      });
-      gsap.to(frag.rotation, { z: Math.PI * 2, duration: 1.1 });
-    } else {
-      frag.position.set(tx, ty, frag.position.z);
-      frag.rotation.z = Math.PI * 2;
-    }
+    // 炸开动画
+    gsap.to(sq.position, { x: p.x, y: p.y, duration: 1.0, ease: "power2.out" });
+    gsap.to(ball.mesh.position, {
+      x: p.x,
+      y: p.y,
+      duration: 1.0,
+      ease: "power2.out",
+    });
+    gsap.to(sq.rotation, { z: Math.PI * 2, duration: 1.0, ease: "power2.out" });
   });
-
-  console.log(
-    "💥 snapshot→world-projected UV→inset→6 filled triangles. No black."
-  );
 }
 
+// === 键盘：A 加对；S 聚拢 ===
 window.addEventListener("keydown", (e) => {
-  if (e.key.toLowerCase() === "a") spawnBall();
-  if (e.key.toLowerCase() === "s") snapshotAndExplodeHexTriangles();
+  const k = e.key.toLowerCase();
+  if (k === "a") {
+    if (exploded) {
+      addSquareBallPair(); // 方块形态：A 新增方块+小球
+    } else {
+      explodeFromHex(); // 六边形形态：先炸回去
+      addSquareBallPair();
+    }
+  }
+  if (k === "s") {
+    if (exploded) {
+      gatherToHex(); // 方块形态：S 聚拢成六边形
+    } else {
+      explodeFromHex(); //（可选）六边形形态：S 再次炸回方块
+    }
+  }
 });
+
+// === 先给点初始内容：默认方块形态下加 6 对 ===
+for (let i = 0; i < 6; i++) addSquareBallPair();
 
 // === Animate ===
 const clock = new THREE.Clock();
+const tmpV3 = new THREE.Vector3();
+const tmpV2 = new THREE.Vector2();
+
 function animate() {
   requestAnimationFrame(animate);
   const dt = clock.getDelta();
 
   for (const b of balls) {
     const m = b.mesh;
-    const pos2 = new THREE.Vector2(m.position.x, m.position.y);
-    const inside = pointInConvexPolygon(pos2);
-    const acc = new THREE.Vector2();
+    let inside = false;
 
+    if (!exploded) {
+      // 六边形判定（世界坐标）
+      const pos2 = new THREE.Vector2(m.position.x, m.position.y);
+      inside = pointInConvexPolygon(pos2);
+    } else {
+      // 方块局部判定（把世界坐标转到该方块的局部）
+      tmpV3.copy(m.position);
+      const local = b.containerMesh.worldToLocal(tmpV3.clone());
+      tmpV2.set(local.x, local.y);
+      inside = pointInSquare(tmpV2, b.bounds);
+    }
+
+    // 状态机
     if (b.state === "OUTSIDE" && inside) b.state = "INSIDE";
     else if (b.state === "INSIDE" && !inside) b.state = "ESCAPING";
     else if (b.state === "ESCAPING" && inside) b.state = "INSIDE";
 
-    if (b.state === "OUTSIDE") {
-      acc.copy(center).sub(m.position).normalize().multiplyScalar(2.5);
-    } else if (b.state === "INSIDE") {
-      let baseAngle = Math.atan2(b.vel.y, b.vel.x);
-      let randOffset = (Math.random() - 0.5) * Math.PI * 1.6;
-      let targetAngle = baseAngle + randOffset;
-      acc
-        .set(Math.cos(targetAngle), Math.sin(targetAngle))
-        .multiplyScalar(0.45);
-    } else if (b.state === "ESCAPING") {
-      acc.copy(center).sub(m.position).normalize().multiplyScalar(0.9);
+    // 力/加速度
+    const acc = new THREE.Vector2();
+    if (!exploded) {
+      // 六边形：以中心吸引
+      if (b.state === "OUTSIDE") {
+        acc.copy(center).sub(m.position).normalize().multiplyScalar(2.5);
+      } else if (b.state === "INSIDE") {
+        let baseAngle = Math.atan2(b.vel.y, b.vel.x);
+        let randOffset = (Math.random() - 0.5) * Math.PI * 1.6;
+        let targetAngle = baseAngle + randOffset;
+        acc
+          .set(Math.cos(targetAngle), Math.sin(targetAngle))
+          .multiplyScalar(0.45);
+      } else if (b.state === "ESCAPING") {
+        acc.copy(center).sub(m.position).normalize().multiplyScalar(0.9);
+      }
+    } else {
+      // 方块：以各自方块中心吸引
+      b.containerMesh.getWorldPosition(tmpV3);
+      const cx = tmpV3.x,
+        cy = tmpV3.y;
+
+      if (b.state === "OUTSIDE") {
+        acc
+          .set(cx - m.position.x, cy - m.position.y)
+          .normalize()
+          .multiplyScalar(2.5);
+      } else if (b.state === "INSIDE") {
+        let baseAngle = Math.atan2(b.vel.y, b.vel.x);
+        let randOffset = (Math.random() - 0.5) * Math.PI * 1.6;
+        let targetAngle = baseAngle + randOffset;
+        acc
+          .set(Math.cos(targetAngle), Math.sin(targetAngle))
+          .multiplyScalar(0.45);
+      } else if (b.state === "ESCAPING") {
+        acc
+          .set(cx - m.position.x, cy - m.position.y)
+          .normalize()
+          .multiplyScalar(0.9);
+      }
+
+      // 同步球到其方块 shader（世界坐标）
+      const mat = b.containerMesh.material;
+      mat.uniforms.uLightPos.value[0].set(m.position.x, m.position.y);
+      mat.uniforms.uLightColor.value[0].copy(b.color);
     }
 
+    // 速度积分 & 阻尼/限速
     b.vel.add(acc.multiplyScalar(dt));
     b.vel.multiplyScalar(0.995);
     const speed = b.vel.length();
@@ -339,25 +449,33 @@ function animate() {
       const ang = Math.random() * Math.PI * 2;
       b.vel.set(Math.cos(ang), Math.sin(ang)).multiplyScalar(0.05);
     }
+
     m.position.x += b.vel.x * dt;
     m.position.y += b.vel.y * dt;
   }
 
-  const trapped = balls.filter((b) =>
-    pointInConvexPolygon(
-      new THREE.Vector2(b.mesh.position.x, b.mesh.position.y)
-    )
-  );
-  const n = Math.min(trapped.length, MAX_LIGHTS);
-  glassUniforms.uLightCount.value = n;
+  // 六边形形态：把在六边形内的球喂给统一 shader
+  if (!exploded && hexMesh) {
+    const trapped = balls.filter((b) =>
+      pointInConvexPolygon(
+        new THREE.Vector2(b.mesh.position.x, b.mesh.position.y)
+      )
+    );
+    const n = Math.min(trapped.length, MAX_LIGHTS);
+    glassUniforms.uLightCount.value = n;
+    glassUniforms.uIntensity.value = 0.75 / Math.pow(Math.max(1, n), 0.3);
 
-  glassUniforms.uIntensity.value = 0.75 / Math.pow(Math.max(1, n), 0.3);
-  for (let i = 0; i < n; i++) {
-    const b = trapped[i];
-    glassUniforms.uLightPos.value[i].set(b.mesh.position.x, b.mesh.position.y);
-    glassUniforms.uLightColor.value[i].copy(b.color);
+    for (let i = 0; i < n; i++) {
+      const b = trapped[i];
+      glassUniforms.uLightPos.value[i].set(
+        b.mesh.position.x,
+        b.mesh.position.y
+      );
+      glassUniforms.uLightColor.value[i].copy(b.color);
+    }
   }
 
   renderer.render(scene, camera);
 }
+
 animate();
