@@ -5,7 +5,7 @@ import gsap from "gsap";
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x000000);
 
-const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 100);
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 10);
 camera.position.z = 1;
 
 scene.add(new THREE.AmbientLight(0xffffff, 10));
@@ -37,34 +37,9 @@ const BALL_RADIUS = 0.015;
 const center = new THREE.Vector3(0, 0, 0);
 const balls = []; // { mesh, color, vel, state, containerMesh?, bounds? }
 
-const HEX_RADIUS = 0.25;
+const HEX_RADIUS = 0.28;
 let hexMesh = null;
 let backMesh = null;
-
-const NORMAL_RADIUS = 0.25;
-let cur_radius = NORMAL_RADIUS; // 环半径（和 ringLayout 的半径一致）
-let ringAngle = 0; // 当前全局相位
-let ANGULAR_SPEED = 0.4; // 角速度（弧度/秒），可调
-
-// 放在 Globals 附近，按需微调
-const GATHER_BASE = 0.5; // 基础时长（每个对象的最短动画时间）
-const GATHER_JITTER = 1.0; // 动画时长的随机抖动范围（最大可额外加 1 秒）
-const GATHER_STAGGER = 0.3; // 索引之间的阶梯延迟（0.3 秒一个）
-const GATHER_EXTRA_DELAY = 0.4; // 额外随机延迟（0~0.4 秒）
-const POST_KICK_MIN = 0.35;
-const POST_KICK_MAX = 0.75;
-const EASES = ["power2.inOut", "power3.inOut", "sine.inOut", "circ.inOut"];
-
-const CONTAINER_SHAPES = ["square", "circle", "triangle", "hex", "diamond"];
-let CONTAINER_TYPE = "square"; // 初始形状
-
-function pickNextShape() {
-  // 过滤掉当前形状
-  const pool = CONTAINER_SHAPES.filter((s) => s !== CONTAINER_TYPE);
-  // 随机选一个
-  CONTAINER_TYPE = pool[Math.floor(Math.random() * pool.length)];
-  console.log("Switched to", CONTAINER_TYPE);
-}
 
 // === Build hex geometry (for later) ===
 function buildHexShape(radius) {
@@ -81,49 +56,6 @@ function buildHexShape(radius) {
 }
 const hexShape = buildHexShape(HEX_RADIUS);
 const hexGeo = new THREE.ShapeGeometry(hexShape);
-
-function makeContainerGeometry(type, size) {
-  switch (type) {
-    case "square":
-      return new THREE.PlaneGeometry(size, size);
-    case "circle":
-      return new THREE.CircleGeometry(size * 0.5, 32);
-    case "triangle": {
-      const s = size;
-      const tri = new THREE.Shape();
-      tri.moveTo(0, 0.58 * s);
-      tri.lineTo(-0.5 * s, -0.29 * s);
-      tri.lineTo(0.5 * s, -0.29 * s);
-      tri.closePath();
-      return new THREE.ShapeGeometry(tri);
-    }
-    case "hex": {
-      const r = size * 0.5;
-      const shp = new THREE.Shape();
-      for (let i = 0; i < 6; i++) {
-        const a = (i / 6) * Math.PI * 2;
-        const x = Math.cos(a) * r,
-          y = Math.sin(a) * r;
-        if (i === 0) shp.moveTo(x, y);
-        else shp.lineTo(x, y);
-      }
-      shp.closePath();
-      return new THREE.ShapeGeometry(shp);
-    }
-    // case "diamond": {
-    //   const s = size;
-    //   const d = new THREE.Shape();
-    //   d.moveTo(0, 0.6 * s);
-    //   d.lineTo(-0.5 * s, 0);
-    //   d.lineTo(0, -0.6 * s);
-    //   d.lineTo(0.5 * s, 0);
-    //   d.closePath();
-    //   return new THREE.ShapeGeometry(d);
-    // }
-    default:
-      return new THREE.PlaneGeometry(size, size);
-  }
-}
 
 // === Hex collision data ===
 const hexVerts = [];
@@ -151,6 +83,35 @@ function pointInSquare(localPos, halfSize) {
     localPos.y >= -halfSize &&
     localPos.y <= halfSize
   );
+}
+
+function relayoutSquarePairs(withAnim = true) {
+  if (!exploded) return;
+  const N = balls.length;
+  const R = 0.37; // 想更疏/更紧就调这个
+
+  balls.forEach((b, i) => {
+    if (!b.containerMesh) return; // 六边形形态下会是 null
+    const p = ringLayout(i, N, R);
+
+    if (withAnim) {
+      gsap.to(b.containerMesh.position, {
+        x: p.x,
+        y: p.y,
+        duration: 0.6,
+        ease: "power2.inOut",
+      });
+      gsap.to(b.mesh.position, {
+        x: p.x,
+        y: p.y,
+        duration: 0.6,
+        ease: "power2.inOut",
+      });
+    } else {
+      b.containerMesh.position.set(p.x, p.y, 0);
+      b.mesh.position.set(p.x, p.y, -0.01);
+    }
+  });
 }
 
 // === Glass shader (shared) ===
@@ -227,72 +188,14 @@ const glassMat = new THREE.ShaderMaterial({
 });
 
 // 背板材质
-const backMat = new THREE.MeshBasicMaterial({ color: 0x090909 });
+const backMat = new THREE.MeshBasicMaterial({ color: 0x0c0c0c });
 
 // === Helpers ===
-function relayoutSquarePairs(withAnim = true, R) {
-  if (!exploded) return;
-  cur_radius = R;
-  const N = balls.length;
-  if (N === 0) return;
-
-  // 1. 找到“最大位移”最小的环偏移
-  let bestOffset = 0;
-  let minMaxDist = Infinity;
-  const testSteps = 60; // 检查多少个偏移角度
-
-  for (let s = 0; s < testSteps; s++) {
-    const offset = (s / testSteps) * Math.PI * 2;
-    let maxDist = 0;
-    for (let i = 0; i < N; i++) {
-      const b = balls[i];
-      if (!b.containerMesh) continue;
-      const p = ringLayout(i, N, offset);
-      const dist = b.containerMesh.position.distanceTo(
-        new THREE.Vector3(p.x, p.y, 0)
-      );
-      if (dist > maxDist) maxDist = dist;
-    }
-    if (maxDist < minMaxDist) {
-      minMaxDist = maxDist;
-      bestOffset = offset;
-    }
-  }
-
-  // 2. 用最优偏移布置
-  for (let i = 0; i < N; i++) {
-    const b = balls[i];
-    if (!b.containerMesh) continue;
-    const p = ringLayout(i, N, bestOffset);
-
-    if (withAnim) {
-      gsap.to(b.containerMesh.position, {
-        x: p.x,
-        y: p.y,
-        duration: 0.6,
-        ease: "power2.inOut",
-      });
-      gsap.to(b.mesh.position, {
-        x: p.x,
-        y: p.y,
-        duration: 0.6,
-        ease: "power2.inOut",
-      });
-    } else {
-      b.containerMesh.position.set(p.x, p.y, 0);
-      b.mesh.position.set(p.x, p.y, -0.01);
-    }
-  }
+function ringLayout(i, count, radius = 0.4) {
+  const angle = (i / Math.max(1, count)) * Math.PI * 2;
+  return new THREE.Vector2(Math.cos(angle) * radius, Math.sin(angle) * radius);
 }
 
-// ringLayout 支持 offsetAngle
-function ringLayout(i, count, offsetAngle = 0) {
-  const angle = (i / Math.max(1, count)) * Math.PI * 2 + offsetAngle;
-  return new THREE.Vector2(
-    Math.cos(angle) * cur_radius,
-    Math.sin(angle) * cur_radius
-  );
-}
 // === 方块形态：新增「方块 + 小球」一对 ===
 function addSquareBallPair() {
   const i = balls.length;
@@ -325,10 +228,10 @@ function addSquareBallPair() {
   mat.uniforms.uRadiusWorld.value = 0.2; // 方块形态：更紧的光斑
   mat.uniforms.uIntensity.value = 0.9;
 
-  const geometry = makeContainerGeometry(CONTAINER_TYPE, SQUARE_SIZE);
-
-  const meshSquare = new THREE.Mesh(geometry, mat);
-
+  const meshSquare = new THREE.Mesh(
+    new THREE.PlaneGeometry(SQUARE_SIZE, SQUARE_SIZE),
+    mat
+  );
   meshSquare.position.set(p.x, p.y, 0);
   scene.add(meshSquare);
 
@@ -351,8 +254,8 @@ function addSquareBallPair() {
     duration: 0.4,
     ease: "back.out(1.7)",
   });
-  cur_radius = NORMAL_RADIUS;
-  relayoutSquarePairs(true, NORMAL_RADIUS); // 每次新增后重排
+
+  relayoutSquarePairs(true); // 每次新增后重排
 }
 
 // === 六边形形态：组装 hex + 背板 ===
@@ -367,22 +270,20 @@ function ensureHexMeshes() {
 }
 
 // === 从“方块形态”聚拢到“六边形形态” ===
-async function gatherToHex() {
-  relayoutSquarePairs(true, 0.55);
-  await new Promise((resolve) => setTimeout(resolve, 100));
-
+function gatherToHex() {
   if (!exploded) return;
   exploded = false;
 
   ensureHexMeshes();
 
+  // 将 hex 先放入场景但透明，待收拢完成淡入（可选）
   if (!scene.children.includes(hexMesh)) scene.add(hexMesh);
   if (!scene.children.includes(backMesh)) scene.add(backMesh);
 
+  // 回收动画：所有方块 & 球往中心收拢
   const tl = gsap.timeline({
-    // 注意：不再在这里统一清理；我们让时间线自然延展到最后一个子动画完成后再清理
     onComplete: () => {
-      // 清理残留方块
+      // 收拢后移除所有方块
       squareBlocks.forEach((sq) => {
         sq.geometry.dispose();
         sq.material.dispose();
@@ -396,70 +297,31 @@ async function gatherToHex() {
     },
   });
 
-  let maxEnd = 0;
+  for (const b of balls) {
+    if (b.containerMesh) {
+      const sq = b.containerMesh;
+      tl.to(
+        sq.position,
+        { x: 0, y: 0, duration: 0.8, ease: "power2.inOut" },
+        0
+      );
+      tl.to(
+        b.mesh.position,
+        { x: 0, y: 0, duration: 0.8, ease: "power2.inOut" },
+        0
+      );
 
-  balls.forEach((b, i) => {
-    if (!b.containerMesh) return;
-
-    // 为每个对象生成不同的时长/延迟/缓动
-    const dur = GATHER_BASE + Math.random() * GATHER_JITTER;
-    const delay = i * GATHER_STAGGER + Math.random() * 0.12;
-    const ease = EASES[(Math.random() * EASES.length) | 0];
-    const startAt = delay; // 时间线里的“位置”
-    const endAt = startAt + dur;
-    if (endAt > maxEnd) maxEnd = endAt;
-
-    const sq = b.containerMesh;
-
-    // 容器与小球分别 tween 到中心，但时间各不相同
-    const targetX = 0;
-    const targetY = 0;
-
-    tl.to(
-      sq.position,
-      { x: targetX, y: targetY, duration: dur, ease },
-      startAt
-    );
-    tl.to(
-      b.mesh.position,
-      { x: targetX, y: targetY, duration: dur, ease },
-      startAt
-    );
-
-    // 在该对象抵达中心的时刻，给它一个随机“起始相位/速度”，并切到六边形状态
-    tl.to(
-      sq.position,
-      {
-        x: targetX,
-        y: targetY,
-        duration: dur,
-        ease,
-        onUpdate: () => {
-          const dist = Math.sqrt(sq.position.x ** 2 + sq.position.y ** 2);
-          if (dist <= HEX_RADIUS) {
-            // 移除当前容器
-            sq.geometry.dispose();
-            sq.material.dispose();
-            scene.remove(sq);
-            const idx = squareBlocks.indexOf(sq);
-            if (idx >= 0) squareBlocks.splice(idx, 1);
-          }
-        },
-      },
-      startAt
-    );
-  });
-
-  cur_radius = NORMAL_RADIUS;
-
-  // 时间线结束点：确保 onComplete 在所有 tween 完毕后触发
-  //（tl 的 duration 会自动取决于最后一个子动画的结束时间，这里只是显式保证）
-  tl.to({}, { duration: 0 }, maxEnd);
+      // 解绑容器（进入六边形形态）
+      b.containerMesh = null;
+      b.bounds = null;
+    }
+    // 设为 OUTSIDE，进入六边形后会被吸入
+    b.state = "OUTSIDE";
+  }
 }
 
 // === 从“六边形形态”炸回“方块形态” ===
 function explodeFromHex() {
-  pickNextShape();
   if (exploded) return;
   exploded = true;
 
@@ -484,9 +346,10 @@ function explodeFromHex() {
     mat.uniforms.uRadiusWorld.value = 0.2;
     mat.uniforms.uIntensity.value = 0.9;
 
-    let geometry = makeContainerGeometry(CONTAINER_TYPE, SQUARE_SIZE);
-    const sq = new THREE.Mesh(geometry, mat);
-
+    const sq = new THREE.Mesh(
+      new THREE.PlaneGeometry(SQUARE_SIZE, SQUARE_SIZE),
+      mat
+    );
     sq.position.set(0, 0, 0);
     scene.add(sq);
     squareBlocks.push(sq);
@@ -539,25 +402,6 @@ const tmpV2 = new THREE.Vector2();
 function animate() {
   requestAnimationFrame(animate);
   const dt = clock.getDelta();
-  if (exploded && balls.length > 0) {
-    ringAngle += ANGULAR_SPEED * dt; // 不断累加相位
-
-    const N = balls.length;
-    for (let i = 0; i < N; i++) {
-      const b = balls[i];
-      if (!b.containerMesh) continue; // 六边形形态下为 null
-
-      const a = (i / N) * Math.PI * 2 + ringAngle;
-      const x = Math.cos(a) * cur_radius;
-      const y = Math.sin(a) * cur_radius;
-
-      // 直接设容器的世界位置（你的吸引力会让小球跟上）
-      b.containerMesh.position.set(x, y, 0);
-
-      // 让方块自身也优雅地转一转（可选）
-      b.containerMesh.rotation.z += 0.6 * dt;
-    }
-  }
 
   for (const b of balls) {
     const m = b.mesh;
@@ -613,7 +457,7 @@ function animate() {
         let targetAngle = baseAngle + randOffset;
         acc
           .set(Math.cos(targetAngle), Math.sin(targetAngle))
-          .multiplyScalar(0.6);
+          .multiplyScalar(0.45);
       } else if (b.state === "ESCAPING") {
         acc
           .set(cx - m.position.x, cy - m.position.y)
