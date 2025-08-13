@@ -37,11 +37,12 @@ const BALL_RADIUS = 0.015;
 const center = new THREE.Vector3(0, 0, 0);
 const balls = []; // { mesh, color, vel, state, containerMesh?, bounds? }
 
-const HEX_RADIUS = 0.25;
+const HEX_RADIUS = 0.2;
 let hexMesh = null;
 let backMesh = null;
 
-const NORMAL_RADIUS = 0.25;
+const NORMAL_RADIUS = 0.3;
+const LARGER_RADIUS = 0.55;
 let cur_radius = NORMAL_RADIUS; // 环半径（和 ringLayout 的半径一致）
 let ringAngle = 0; // 当前全局相位
 let ANGULAR_SPEED = 0.4; // 角速度（弧度/秒），可调
@@ -368,7 +369,7 @@ function ensureHexMeshes() {
 
 // === 从“方块形态”聚拢到“六边形形态” ===
 async function gatherToHex() {
-  relayoutSquarePairs(true, 0.55);
+  relayoutSquarePairs(true, LARGER_RADIUS);
   await new Promise((resolve) => setTimeout(resolve, 100));
 
   if (!exploded) return;
@@ -420,9 +421,24 @@ async function gatherToHex() {
       { x: targetX, y: targetY, duration: dur, ease },
       startAt
     );
+    // 小球 tween（保持不变的 x,y 目标），只新增 onUpdate
     tl.to(
       b.mesh.position,
-      { x: targetX, y: targetY, duration: dur, ease },
+      {
+        x: 0,
+        y: 0,
+        duration: dur,
+        ease,
+        onUpdate: function () {
+          // 到原点的距离（你在根节点 tween 到 0,0）
+          const dist = Math.hypot(b.mesh.position.x, b.mesh.position.y);
+          if (!b.isHidden && dist <= HEX_RADIUS) {
+            b.isHidden = true;
+            b.mesh.visible = false; // 只隐藏网格
+            // 不要 this.kill()，让位置继续更新，这样光还能动
+          }
+        },
+      },
       startAt
     );
 
@@ -459,7 +475,6 @@ async function gatherToHex() {
 
 // === 从“六边形形态”炸回“方块形态” ===
 function explodeFromHex() {
-  pickNextShape();
   if (exploded) return;
   exploded = true;
 
@@ -467,45 +482,78 @@ function explodeFromHex() {
   if (hexMesh) scene.remove(hexMesh);
   if (backMesh) scene.remove(backMesh);
 
-  // 为每个球创建对等方块并飞散
-  squareBlocks = [];
-  balls.forEach((ball, i) => {
-    const p = ringLayout(i, balls.length);
+  // 如果你有随机形状选择器，放开这行；否则保持当前 CONTAINER_TYPE
+  if (typeof pickNextShape === "function") pickNextShape();
 
-    // 方块
+  squareBlocks = [];
+  const N = balls.length;
+
+  for (let i = 0; i < N; i++) {
+    const b = balls[i];
+
+    // 让被吸收隐藏的球回归显示，并清理/复位
+    b.isHidden = false;
+    b.mesh.visible = true;
+    gsap.killTweensOf(b.mesh.position); // 停掉 gather 时遗留的 tween
+    b.vel.set(0, 0);
+
+    // 材质（独立 uniforms，灯光跟随这个球）
     const mat = glassMat.clone();
     mat.uniforms = THREE.UniformsUtils.clone(glassMat.uniforms);
     mat.uniforms.uLightCount.value = 1;
     mat.uniforms.uLightPos.value[0] = new THREE.Vector2(
-      ball.mesh.position.x,
-      ball.mesh.position.y
+      b.mesh.position.x,
+      b.mesh.position.y
     );
-    mat.uniforms.uLightColor.value[0] = ball.color.clone();
+    mat.uniforms.uLightColor.value[0] = b.color.clone();
     mat.uniforms.uRadiusWorld.value = 0.2;
     mat.uniforms.uIntensity.value = 0.9;
 
-    let geometry = makeContainerGeometry(CONTAINER_TYPE, SQUARE_SIZE);
-    const sq = new THREE.Mesh(geometry, mat);
+    // 几何（用你的工厂；没有就按 square/circle）
+    let geo;
+    if (typeof makeContainerGeometry === "function") {
+      const shapeType =
+        typeof CONTAINER_TYPE !== "undefined"
+          ? CONTAINER_TYPE
+          : typeof currentContainerShape !== "undefined"
+          ? currentContainerShape
+          : "square";
+      geo = makeContainerGeometry(shapeType, SQUARE_SIZE);
+    } else {
+      geo =
+        CONTAINER_TYPE === "circle"
+          ? new THREE.CircleGeometry(SQUARE_SIZE * 0.5, 32)
+          : new THREE.PlaneGeometry(SQUARE_SIZE, SQUARE_SIZE);
+    }
 
+    const sq = new THREE.Mesh(geo, mat);
     sq.position.set(0, 0, 0);
     scene.add(sq);
+
+    // 记录关系（球不是子对象；只建立引用，方便物理吸引/局部判定）
     squareBlocks.push(sq);
+    b.containerMesh = sq;
+    b.bounds = SQUARE_SIZE * 0.5;
+    b.state = "INSIDE";
 
-    // 绑定
-    ball.containerMesh = sq;
-    ball.bounds = SQUARE_SIZE * 0.5;
-    ball.state = "INSIDE";
+    // 目标：环上位置
+    const p = ringLayout(i, N);
 
-    // 炸开动画
+    // 球和方块一起从中心飞回环上
     gsap.to(sq.position, { x: p.x, y: p.y, duration: 1.0, ease: "power2.out" });
-    gsap.to(ball.mesh.position, {
+    gsap.to(b.mesh.position, {
       x: p.x,
       y: p.y,
       duration: 1.0,
       ease: "power2.out",
     });
     gsap.to(sq.rotation, { z: Math.PI * 2, duration: 1.0, ease: "power2.out" });
-  });
+  }
+
+  // 爆炸后做一次最小位移重排（可保留/可删）
+  if (typeof relayoutSquarePairs === "function") {
+    relayoutSquarePairs(true, cur_radius);
+  }
 }
 
 // === 键盘：A 加对；S 聚拢 ===
