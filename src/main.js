@@ -714,3 +714,266 @@ function animate() {
 }
 
 animate();
+function highlightText(text, keywords) {
+  let result = text;
+  keywords.forEach((kw) => {
+    const regex = new RegExp(`(${kw})`, "gi"); // 忽略大小写
+    result = result.replace(
+      regex,
+      `<span style="background-color: purple; color: white;">$1</span>`
+    );
+  });
+  return result;
+}
+let isRefresh = false;
+const caption = document.getElementById("caption");
+const textWS = new WebSocket("ws://localhost:8000/ws/text");
+textWS.onopen = () => textWS.send("ping"); // 可选
+textWS.onmessage = (ev) => {
+  caption;
+  const data = JSON.parse(ev.data); // { event, text, keywords, timestamp }
+  console.log("文本:", data.text, "关键词:", data.keywords);
+  caption.innerHTML = highlightText(data.text, data.keywords);
+};
+
+// 创建用于播放音频的 AudioContext
+const globalAudioCtx = new (window.AudioContext || window.webkitAudioContext)({
+  sampleRate: 24000,
+});
+const analyserNode = globalAudioCtx.createAnalyser();
+analyserNode.fftSize = 256;
+const audioDataArray = new Float32Array(analyserNode.fftSize);
+
+const audioCtx = new AudioContext({ sampleRate: 24000 });
+const playQueue = []; // 播放队列，避免卡顿
+
+// 创建 WebSocket 接收后端音频数据
+const audioSocket = new WebSocket("ws://localhost:8000/ws/tts");
+audioSocket.binaryType = "arraybuffer";
+
+audioSocket.onmessage = async (event) => {
+  const arrayBuffer = event.data;
+
+  // 检查音频数据基本状态
+  console.log("📥 收到音频包:", arrayBuffer.byteLength);
+  const float32Data = new Float32Array(arrayBuffer);
+  const bytes = new Uint8Array(arrayBuffer);
+  // console.log("原始前10字节:", bytes.slice(0, 10));
+  // console.log("Float32前5个:", float32Data.slice(0, 5));
+
+  // ✅ 确保音频值范围合理
+  const max = Math.max(...float32Data);
+  const min = Math.min(...float32Data);
+
+  // ✅ 创建 AudioBuffer
+  const audioBuffer = globalAudioCtx.createBuffer(
+    1, // 单声道
+    float32Data.length,
+    globalAudioCtx.sampleRate
+  );
+  audioBuffer.copyToChannel(float32Data, 0);
+
+  // ✅ 入队并播放
+  playQueue.push(audioBuffer);
+  playFromQueue();
+};
+
+document.body.addEventListener(
+  "click",
+  () => {
+    if (audioCtx.state !== "running") {
+      audioCtx.resume();
+      console.log("🔊 audioCtx resumed");
+    }
+    if (globalAudioCtx.state !== "running") {
+      globalAudioCtx.resume();
+      console.log("🔊 globalAudioCtx resumed");
+    }
+  },
+  { once: true }
+);
+
+let isPlaying = false;
+let nextPlayTime = globalAudioCtx.currentTime;
+
+function playFromQueue() {
+  if (isPlaying || playQueue.length === 0) return;
+
+  const buffer = playQueue.shift();
+  const source = globalAudioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(analyserNode);
+  analyserNode.connect(globalAudioCtx.destination);
+
+  // 避免排队时间落后于当前时间
+  const safetyLead = 0.02;
+  nextPlayTime = Math.max(
+    nextPlayTime,
+    globalAudioCtx.currentTime + safetyLead
+  );
+
+  source.start(nextPlayTime);
+  nextPlayTime += buffer.duration;
+
+  isPlaying = true;
+
+  source.onended = () => {
+    isPlaying = false;
+    // 如果队列里还有，继续下一段；否则停掉 VAD
+    if (playQueue.length === 0) {
+      stopPlaybackVAD();
+    }
+    playFromQueue();
+  };
+}
+
+let currentEventId = null;
+
+async function pollBackendStatus() {
+  try {
+    const response = await fetch("http://localhost:8000/status");
+
+    const data = await response.json();
+    let eventId = data.event_id;
+
+    // ✅ 自动修复：如果播放结束但后端还没更新 event_id
+    const audioIdle = playQueue.length === 0 && !isPlaying;
+    if (eventId === 359 && audioIdle) {
+      console.log("✅ 音频播放完毕，自动切换为 event_id 999");
+      eventId = 999;
+    }
+
+    if (eventId !== currentEventId) {
+      currentEventId = eventId;
+      handleEvent(eventId, data.text);
+    }
+  } catch (error) {
+    console.error("获取后端状态失败:", error);
+  }
+}
+
+function handleEvent(eventId, text) {
+  console.log("切换状态:", eventId, "识别文本:", text);
+}
+
+// 每 100ms 轮询一次
+setInterval(pollBackendStatus, 100);
+
+const API_BASE = "http://localhost:8000";
+const BLANK_PAGE = "/thankyou.html"; // 你想跳去的页面
+
+(async () => {
+  try {
+    const res = await fetch(`${API_BASE}/availability`, { cache: "no-store" });
+    const data = await res.json();
+
+    console.log(data); // ✅ 打印解析后的结果
+
+    if (data.occupied) {
+      isRefresh = true;
+      location.replace(BLANK_PAGE);
+      return;
+    }
+  } catch (err) {
+    console.error("检查占用状态失败", err);
+  }
+
+  // 只有等上面的 await 完成后，才会执行这里
+  console.log("WebSocket 建立逻辑在这里跑");
+})();
+
+//麦克风输入
+let micStream;
+let socket = new WebSocket("ws://localhost:8000/ws/audio");
+socket.binaryType = "arraybuffer";
+
+// Float32 → Int16 转换函数
+function convertFloat32ToInt16(float32Array) {
+  const int16Array = new Int16Array(float32Array.length);
+  for (let i = 0; i < float32Array.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32Array[i]));
+    int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return new Uint8Array(int16Array.buffer);
+}
+
+socket.onopen = async () => {
+  console.log("🎤 WebSocket连接建立，准备推送音频数据");
+
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const audioCtx = new AudioContext({ sampleRate: 24000 }); // 确保采样率一致
+  const source = audioCtx.createMediaStreamSource(micStream);
+  const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+  source.connect(processor);
+  processor.connect(audioCtx.destination);
+
+  processor.onaudioprocess = (event) => {
+    const input = event.inputBuffer.getChannelData(0); // Float32Array
+    const pcmBytes = convertFloat32ToInt16(input); // ✅ 转换为 Int16 PCM
+
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(pcmBytes); // ✅ 发送 Int16 PCM 数据
+    }
+  };
+};
+
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
+
+startBtn.onclick = () => {
+  isRefresh = true;
+  fetch("http://localhost:8000/start", {
+    method: "POST",
+  }).catch((err) => console.error("❌ Start error:", err));
+
+  // 🌟 一秒后刷新页面
+  setTimeout(() => {
+    location.reload();
+  }, 2000);
+};
+
+stopBtn.onclick = async () => {
+  try {
+    const res = await fetch("http://localhost:8000/stop", {
+      method: "POST",
+    });
+    const data = await res.json();
+    console.log("🛑 Stop Response:", data);
+  } catch (err) {
+    console.error("❌ Stop error:", err);
+  }
+
+  // 🌟 一秒后刷新页面
+  setTimeout(() => {
+    location.reload();
+  }, 1000);
+};
+
+setTimeout(() => {
+  console.log("⏰ 页面已打开超过5分钟，自动停止");
+
+  fetch("http://localhost:8000/stop", {
+    method: "POST",
+  })
+    .then((res) => res.json())
+    .then((data) => {
+      console.log("🛑 自动 Stop Response:", data);
+      window.location.href = "/thankyou.html"; // 或你的主页/提示页
+    })
+    .catch((err) => {
+      console.error("❌ 自动 Stop 请求失败:", err);
+      window.location.href = "/thankyou.html"; // 或你的主页/提示页
+    });
+}, 5 * 60 * 1000); // 60秒
+
+window.addEventListener("unload", () => {
+  if (!isRefresh) {
+    fetch("http://localhost:8000/stop", {
+      method: "POST",
+      keepalive: true,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "close" }), // 可选
+    });
+  }
+});

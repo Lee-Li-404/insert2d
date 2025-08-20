@@ -26,6 +26,38 @@
         border-radius: 4px;
         pointer-events: none;
       }
+      button {
+        padding: 10px 20px;
+        font-size: 16px;
+        border: none;
+        border-radius: 6px;
+        margin: 10px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        color: white;
+      }
+
+      #startBtn {
+        background-color: #4caf50;
+      }
+      #startBtn:hover {
+        background-color: #45a049;
+        transform: scale(1.05);
+      }
+
+      #stopBtn {
+        background-color: #f44336;
+      }
+      #stopBtn:hover {
+        background-color: #d32f2f;
+        transform: scale(1.05);
+      }
+      #caption {
+        position: absolute;
+        color: white;
+        margin-left: 50%;
+        margin-top: 45%;
+      }
     </style>
 
     <!-- Importmap -->
@@ -41,7 +73,9 @@
 
   <body>
     <div id="state-indicator">State: <span id="current-state">X</span></div>
-
+    <button id="startBtn">Start</button>
+    <button id="stopBtn">Stop</button>
+    <p id="caption">test</p>
     <!-- Main logic -->
     <script type="module" src="/src/main.js"></script>
 
