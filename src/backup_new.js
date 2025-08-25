@@ -1,7 +1,5 @@
 import * as THREE from "three";
 import gsap from "gsap";
-import { Text } from "troika-three-text";
-import { add } from "three/tsl";
 
 // === Scene ===
 const scene = new THREE.Scene();
@@ -30,35 +28,72 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
-// === Globals (HEX-ONLY) ===
+// === Globals ===
 const BALL_RADIUS = 0.015;
-const HEX_RADIUS = 0.2; // 六边形半径（与 shader/碰撞一致）
-const MAX_LIGHTS = 20;
 
 const center = new THREE.Vector3(0, 0, 0);
-const balls = []; // { mesh, color, vel, state }
-const keywordToBall = new Map(); // kw -> ball（这里用于示范重复关键词的反馈）
+const balls = []; // { mesh, color, vel, state, containerMesh?, bounds? }
 
-// 力学拨杆（后面你可以接事件去调）
-let K_CENTER = 0.28; // 向心吸引强度
-let NOISE_MAG = 0.35; // 随机扰动强度
-const MAX_SPEED = 0.5;
-const MIN_SPEED = 0.05;
+const HEX_RADIUS = 0.2;
+let hexMesh = null;
+let backMesh = null;
 
-let idleFactor = 0.4;
+// 放在 Globals 附近，按需微调
+const GATHER_BASE = 0.25; // 基础时长（每个对象的最短动画时间）
+const GATHER_JITTER = 0.4; // 动画时长的随机抖动范围（最大可额外加 1 秒）
+const GATHER_STAGGER = 0.3; // 索引之间的阶梯延迟（0.3 秒一个）
+const GATHER_EXTRA_DELAY = 0.4; // 额外随机延迟（0~0.4 秒）
+const POST_KICK_MIN = 0.35;
+const POST_KICK_MAX = 0.75;
+const EASES = ["power2.inOut", "power3.inOut", "sine.inOut", "circ.inOut"];
 
-// 黄金角分布（入场角度更均匀）
-let goldenIdx = 0;
-const GOLDEN_ANGLE = 2.3999632297; // ≈137.5°
+// === Keyword registry ===
+const seenKeywords = new Set();
 
-// === Helpers ===
-function hashColorFromString() {
-  return new THREE.Color(Math.random(), Math.random(), Math.random());
+// 稳定哈希上色（同词同色）
+function hashColorFromString(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (h * 131 + str.charCodeAt(i)) >>> 0;
+  const hue = (h % 360) / 360;
+  return new THREE.Color().setHSL(hue, 0.75, 0.55);
 }
 
-spawnKeywordBall("");
+// 把关键词画成一张 Sprite（正交相机下简洁可控）
+function makeTextSprite(text, color = "#ffffff") {
+  const canvas = document.createElement("canvas");
+  const pad = 12,
+    fz = 50; // 字体尺寸越大，收缩时更清晰
+  const ctx = canvas.getContext("2d");
+  ctx.font = `${fz}px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial`;
+  const tw = Math.ceil(ctx.measureText(text).width);
+  canvas.width = tw + pad * 2;
+  canvas.height = fz + pad * 2;
 
-// === Hex geometry & shader ===
+  const ctx2 = canvas.getContext("2d");
+  ctx2.font = ctx.font;
+  ctx2.fillStyle = color;
+  ctx2.textBaseline = "top";
+  ctx2.fillText(text, pad, pad);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true });
+  const sp = new THREE.Sprite(mat);
+
+  // 像素→世界的缩放；正交相机下用常数即可（可按观感微调）
+  const scale = 0.0043;
+  sp.scale.set(canvas.width * scale, canvas.height * scale, 1);
+  return sp;
+}
+
+function pickNextShape() {
+  // 过滤掉当前形状
+  const pool = CONTAINER_SHAPES.filter((s) => s !== CONTAINER_TYPE);
+  // 随机选一个
+  CONTAINER_TYPE = pool[Math.floor(Math.random() * pool.length)];
+  console.log("Switched to", CONTAINER_TYPE);
+}
+
+// === Build hex geometry (for later) ===
 function buildHexShape(radius) {
   const shape = new THREE.Shape();
   for (let i = 0; i < 6; i++) {
@@ -71,117 +106,15 @@ function buildHexShape(radius) {
   shape.closePath();
   return shape;
 }
-
 const hexShape = buildHexShape(HEX_RADIUS);
 const hexGeo = new THREE.ShapeGeometry(hexShape);
 
-// 新增两个 uniform
-const glassUniforms = {
-  uLightCount: { value: 0 },
-  uLightPos: {
-    value: Array.from({ length: MAX_LIGHTS }, () => new THREE.Vector2()),
-  },
-  uLightColor: {
-    value: Array.from({ length: MAX_LIGHTS }, () => new THREE.Color()),
-  },
-  uRadiusWorld: { value: 0.5 },
-  uIntensity: { value: 0.75 },
-  uGrainScale: { value: 120.0 },
-  uGrainAmount: { value: 0.015 },
-  uAlpha: { value: 0.72 },
-  uHexApothem: { value: HEX_RADIUS * 0.8660254037844386 }, // ★ 新增：六边形内切半径
-  uHexFeather: { value: 0.006 }, // ★ 新增：边缘羽化宽度（世界单位）
-};
-
-const glassMat = new THREE.ShaderMaterial({
-  transparent: true,
-  depthWrite: false,
-  uniforms: glassUniforms,
-  vertexShader: /* glsl */ `
-    varying vec2 vWorld;
-    void main(){
-      vec4 wp = modelMatrix * vec4(position, 1.0);
-      vWorld = wp.xy;
-      gl_Position = projectionMatrix * viewMatrix * wp;
-    }
-  `,
-  fragmentShader: /* glsl */ `
-    varying vec2 vWorld;
-    uniform int   uLightCount;
-    uniform vec2  uLightPos[${MAX_LIGHTS}];
-    uniform vec3  uLightColor[${MAX_LIGHTS}];
-    uniform float uRadiusWorld;
-    uniform float uIntensity;
-    uniform float uGrainScale;
-    uniform float uGrainAmount;
-    uniform float uAlpha;
-    uniform float uHexApothem; // 六边形内切半径（世界单位）
-    uniform float uHexFeather; // 边缘羽化宽度（世界单位）
-    float sdHex(vec2 p, float r) {
-      p = abs(p);
-      return max(dot(p, vec2(0.8660254, 0.5)), p.x) - r;
-    }
-
-    float hash(vec2 p){return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453);}
-    float noise(vec2 p){
-      vec2 i=floor(p), f=fract(p);
-      float a=hash(i), b=hash(i+vec2(1.,0.));
-      float c=hash(i+vec2(0.,1.)), d=hash(i+vec2(1.,1.));
-      vec2 u=f*f*(3.-2.*f);
-      return mix(a,b,u.x)+(c-a)*u.y*(1.-u.x)+(d-b)*u.x*u.y;
-    }
-
-    void main(){
-      vec3 accum = vec3(0.0);
-      float sumFall = 0.0;
-
-      // ★ 六边形掩膜：inside≈1，outside≈0，边缘平滑过渡
-      float dHex = sdHex(vWorld, uHexApothem);
-      float hexMask = smoothstep(uHexFeather, 0.0, dHex);
-
-      for (int i=0; i<${MAX_LIGHTS}; i++){
-        if (i>=uLightCount) break;
-        float dist = length(vWorld - uLightPos[i]);
-        float g = (noise(vWorld * uGrainScale + float(i)*13.37) - 0.5) * uGrainAmount;
-        dist += g;
-
-        float fall = smoothstep(uRadiusWorld, 0.0, dist);
-        fall = pow(fall, 1.35);
-
-        // ★ 只在六边形内部生效
-        fall *= hexMask;
-
-        accum += uLightColor[i] * fall;
-        sumFall += fall;
-      }
-
-      vec3 color = accum * uIntensity;
-      float alpha = clamp(sumFall, 0.0, 1.0) * uAlpha;
-      gl_FragColor = vec4(color, alpha);
-    }
-  `,
-});
-
-const backMat = new THREE.MeshBasicMaterial({ color: 0x090909 });
-
-// 六边形 Mesh
-let hexMesh = null;
-let backMesh = null;
-
-function ensureHexMeshes() {
-  if (!hexMesh) hexMesh = new THREE.Mesh(hexGeo, glassMat);
-  if (!backMesh) {
-    backMesh = new THREE.Mesh(hexGeo, backMat);
-    backMesh.position.z = -0.01;
-  }
-}
-
-// 初始化即添加 HEX 容器
+// HEX-ONLY: 初始化就显示六边形容器
 ensureHexMeshes();
-scene.add(hexMesh);
-scene.add(backMesh);
+if (!scene.children.includes(hexMesh)) scene.add(hexMesh);
+if (!scene.children.includes(backMesh)) scene.add(backMesh);
 
-// === Hex collision (point-in-hex) ===
+// === Hex collision data ===
 const hexVerts = [];
 for (let i = 0; i < 6; i++) {
   const a = (i / 6) * Math.PI * 2;
@@ -200,218 +133,97 @@ function pointInConvexPolygon(p) {
   return true;
 }
 
-function nextPow2(x) {
-  return Math.pow(2, Math.ceil(Math.log2(Math.max(1, x))));
-}
+// === Glass shader (shared) ===
+const MAX_LIGHTS = 20;
+const glassUniforms = {
+  uLightCount: { value: 0 },
+  uLightPos: {
+    value: Array.from({ length: MAX_LIGHTS }, () => new THREE.Vector2()),
+  },
+  uLightColor: {
+    value: Array.from({ length: MAX_LIGHTS }, () => new THREE.Color()),
+  },
+  uRadiusWorld: { value: 0.5 },
+  uIntensity: { value: 0.75 },
+  uGrainScale: { value: 120.0 },
+  uGrainAmount: { value: 0.015 },
+  uAlpha: { value: 0.72 },
+};
 
-// 将“希望的像素高度”转换成世界高度（正交相机）
-function pixelsToWorldHeight(px) {
-  const viewH = renderer.domElement.height; // 真实像素高
-  const worldH = camera.top - camera.bottom; // 世界高
-  return (px / viewH) * worldH;
-}
+const glassMat = new THREE.ShaderMaterial({
+  transparent: true,
+  depthWrite: false,
+  uniforms: glassUniforms,
+  vertexShader: `
+    varying vec2 vWorld;
+    void main() {
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vWorld = wp.xy;
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }
+  `,
+  fragmentShader: `
+    varying vec2 vWorld;
+    uniform int   uLightCount;
+    uniform vec2  uLightPos[${MAX_LIGHTS}];
+    uniform vec3  uLightColor[${MAX_LIGHTS}];
+    uniform float uRadiusWorld;
+    uniform float uIntensity;
+    uniform float uGrainScale;
+    uniform float uGrainAmount;
+    uniform float uAlpha;
 
-let breatheTl = null;
+    float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
+    float noise(vec2 p){
+      vec2 i=floor(p), f=fract(p);
+      float a=hash(i);
+      float b=hash(i+vec2(1.,0.));
+      float c=hash(i+vec2(0.,1.));
+      float d=hash(i+vec2(1.,1.));
+      vec2 u=f*f*(3.-2.*f);
+      return mix(a,b,u.x) + (c-a)*u.y*(1.-u.x) + (d-b)*u.x*u.y;
+    }
 
-function breatheHex({
-  scaleUp = 1.03, // 轻微放大幅度
-  oneBeat = 0.18, // 单次起伏时长
-  repeats = 2, // 呼吸次数（两次）
-  ease = "power2.inOut",
-} = {}) {
-  // 如果上一次还在播，重启
-  if (breatheTl) {
-    breatheTl.kill();
-    breatheTl = null;
-  }
+    void main() {
+      vec3 accum = vec3(0.0);
+      float sumFall = 0.0;
 
-  // 用代理值驱动缩放，同时同步 uRadiusWorld
-  const proxy = { s: 1.0 };
-
-  breatheTl = gsap.timeline({
-    defaults: { duration: oneBeat, ease },
-    onUpdate: () => {
-      const s = proxy.s;
-      if (hexMesh) hexMesh.scale.setScalar(s);
-      if (backMesh) backMesh.scale.setScalar(s);
-      // 半径随缩放同步，保持光晕衰减逻辑一致
-      // glassUniforms.uRadiusWorld.value = HEX_RADIUS * s;
-    },
-  });
-
-  // 一个“呼吸”= 放大->缩回
-  for (let i = 0; i < repeats; i++) {
-    breatheTl.to(proxy, { s: scaleUp }).to(proxy, { s: 1.0 });
-  }
-}
-
-// 高清文字 Sprite：传入目标“屏幕像素高度”
-function makeTextSprite(text, color = "#ffffff", targetPixelHeight = 48) {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2.5); // 保守上限，防止超大纹理
-  const pad = Math.round(16 * dpr);
-  const fontPx = Math.round(targetPixelHeight * dpr * 2); // 再放大一档，给边缘留余量
-
-  // 先测量文本宽度（按 DPR 放大）
-  const measure = document.createElement("canvas").getContext("2d");
-  measure.font = `${fontPx}px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial`;
-  const textW = Math.ceil(measure.measureText(text).width);
-
-  // 画布尺寸用最近的 2 的幂（POT），以启用 mipmap
-  const rawW = textW + pad * 2;
-  const rawH = fontPx + pad * 2;
-  const potW = nextPow2(rawW);
-  const potH = nextPow2(rawH);
-
-  const canvas = document.createElement("canvas");
-  canvas.width = potW;
-  canvas.height = potH;
-
-  const ctx = canvas.getContext("2d");
-  ctx.font = measure.font;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-
-  // 可选：描边增强对比度（柔和外描边）
-  ctx.lineWidth = Math.max(1, Math.round(fontPx * 0.12));
-  ctx.strokeStyle = "rgba(0,0,0,0.35)";
-  ctx.strokeText(text, potW / 2, potH / 2);
-
-  ctx.fillStyle = color;
-  ctx.fillText(text, potW / 2, potH / 2);
-
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.generateMipmaps = true; // 现在是 POT，可以开 mipmap
-  tex.minFilter = THREE.LinearMipmapLinearFilter; // 缩小时更清
-  tex.magFilter = THREE.LinearFilter;
-  tex.anisotropy = renderer.capabilities.getMaxAnisotropy?.() ?? 1;
-  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-  tex.needsUpdate = true;
-  tex.colorSpace = THREE.SRGBColorSpace;
-
-  const mat = new THREE.SpriteMaterial({
-    map: tex,
-    transparent: true,
-    depthTest: false,
-    depthWrite: false,
-  });
-
-  const sp = new THREE.Sprite(mat);
-  sp.center.set(0.5, 0.5);
-  sp.renderOrder = 2;
-
-  // 让屏幕像素高度 ≈ targetPixelHeight
-  const aspect = potW / potH;
-  const worldH = pixelsToWorldHeight(targetPixelHeight);
-  sp.scale.set(worldH * aspect, worldH, 1);
-  return sp;
-}
-
-// 文字与小球“同点生成”：文字缩小→小球放大→小球再进入 HEX 内部
-function spawnKeywordBall(kw) {
-  const key = kw.toLowerCase();
-  if (keywordToBall.has(key)) {
-    const ball = keywordToBall.get(key);
-    gsap.fromTo(
-      ball.mesh.scale,
-      { x: 1, y: 1 },
-      {
-        x: 1.15,
-        y: 1.15,
-        duration: 0.18,
-        yoyo: true,
-        repeat: 1,
-        ease: "power2.inOut",
+      for(int i=0;i<${MAX_LIGHTS};i++){
+        if(i>=uLightCount) break;
+        float dist = length(vWorld - uLightPos[i]);
+        float g = (noise(vWorld * uGrainScale + float(i)*13.37) - 0.5) * uGrainAmount;
+        dist += g;
+        float fall = smoothstep(uRadiusWorld, 0.0, dist);
+        fall = pow(fall, 1.35);
+        accum += uLightColor[i] * fall;
+        sumFall += fall;
       }
-    );
-    return;
+
+      vec3 color = accum * uIntensity;
+      float alpha = clamp(sumFall, 0.0, 1.0) * uAlpha;
+      gl_FragColor = vec4(color, alpha);
+    }
+  `,
+});
+
+// 背板材质
+const backMat = new THREE.MeshBasicMaterial({ color: 0x090909 });
+
+// === 六边形形态：组装 hex + 背板 ===
+function ensureHexMeshes() {
+  if (!hexMesh) {
+    hexMesh = new THREE.Mesh(hexGeo, glassMat);
   }
-
-  const color = hashColorFromString(kw);
-
-  const angle = goldenIdx++ * GOLDEN_ANGLE;
-  const rEnter = HEX_RADIUS * 1.9;
-  const rSettle = HEX_RADIUS * 0.8;
-
-  const x0 = Math.cos(angle) * rEnter,
-    y0 = Math.sin(angle) * rEnter;
-  const xI = Math.cos(angle) * rSettle,
-    yI = Math.sin(angle) * rSettle;
-
-  // 文字与小球同点生成
-  // 使用
-  const textSprite = makeTextSprite(kw, `#${color.getHexString()}`, 38); // 48px 高
-  textSprite.position.set(x0, y0, 0.01);
-  scene.add(textSprite);
-
-  const matBall = new THREE.MeshBasicMaterial({
-    color,
-    transparent: true,
-    opacity: 0.25,
-    depthWrite: false,
-  });
-  const meshBall = new THREE.Mesh(
-    new THREE.CircleGeometry(BALL_RADIUS, 32),
-    matBall
-  );
-  meshBall.position.set(x0, y0, 0.0);
-  meshBall.scale.setScalar(0.0);
-  scene.add(meshBall);
-
-  const ball = {
-    mesh: meshBall,
-    color,
-    vel: new THREE.Vector2(-Math.sin(angle) * 0.08, Math.cos(angle) * 0.08),
-    state: "OUTSIDE",
-  };
-
-  // 时间线
-  const tl = gsap.timeline();
-
-  // A 阶段
-  tl.to(textSprite.scale, { x: 0, y: 0, duration: 0.8, ease: "power2.inOut" })
-    .to(
-      textSprite.material,
-      { opacity: 0, duration: 0.8, ease: "power2.inOut" },
-      0
-    )
-    .fromTo(
-      meshBall.scale,
-      { x: 0, y: 0, z: 0 },
-      {
-        x: 1,
-        y: 1,
-        z: 1,
-        duration: 0.8,
-        ease: "back.out(1.5)",
-        immediateRender: false,
-      },
-      0
-    )
-    .addLabel("A_end"); // 记录 A 阶段结束点
-
-  // B 阶段：在 A_end 提前 0.2s
-  tl.to(
-    meshBall.position,
-    {
-      x: xI,
-      y: yI,
-      duration: 0.8,
-      ease: "power2.inOut",
-      onComplete: () => {
-        balls.push(ball);
-        keywordToBall.set(key, ball);
-        scene.remove(textSprite);
-        textSprite.material.map?.dispose?.();
-        textSprite.material.dispose();
-        textSprite.geometry?.dispose?.();
-      },
-    },
-    "A_end-=0.2"
-  );
+  if (!backMesh) {
+    backMesh = new THREE.Mesh(hexGeo, backMat);
+    backMesh.position.z = -0.01;
+  }
 }
 
-// === Animate (HEX-ONLY) ===
+// === Animate ===
 const clock = new THREE.Clock();
+const tmpV3 = new THREE.Vector3();
+const tmpV2 = new THREE.Vector2();
 
 function animate() {
   requestAnimationFrame(animate);
@@ -419,105 +231,134 @@ function animate() {
 
   for (const b of balls) {
     const m = b.mesh;
+    let inside = false;
 
-    // 六边形内外判定（世界坐标）
+    // 六边形判定（世界坐标）
     const pos2 = new THREE.Vector2(m.position.x, m.position.y);
-    const inside = pointInConvexPolygon(pos2);
+    inside = pointInConvexPolygon(pos2);
 
-    // 简化状态：OUTSIDE/INSIDE/ESCAPING
+    // 状态机
     if (b.state === "OUTSIDE" && inside) b.state = "INSIDE";
     else if (b.state === "INSIDE" && !inside) b.state = "ESCAPING";
     else if (b.state === "ESCAPING" && inside) b.state = "INSIDE";
 
-    // 力/加速度（六边形模式）
+    // 力/加速度
     const acc = new THREE.Vector2();
-    if (b.state === "OUTSIDE") {
-      acc
-        .copy(center)
-        .sub(m.position)
-        .normalize()
-        .multiplyScalar(2.5)
-        .multiplyScalar(idleFactor);
-    } else if (b.state === "INSIDE") {
-      // 旧感觉：仅随机游走（不加常驻向心）
-      const baseAngle = Math.atan2(b.vel.y, b.vel.x);
-      const randOffset = (Math.random() - 0.5) * Math.PI * 1.6;
-      const targetAngle = baseAngle + randOffset;
-      acc
-        .set(Math.cos(targetAngle), Math.sin(targetAngle))
-        .multiplyScalar(0.45)
-        .multiplyScalar(idleFactor); // 随机游走强度（可微调 0.35~0.55）
-    } else if (b.state === "ESCAPING") {
-      acc
-        .copy(center)
-        .sub(m.position)
-        .normalize()
-        .multiplyScalar(0.9)
-        .multiplyScalar(idleFactor);
+    if (!exploded) {
+      // 六边形：以中心吸引
+      if (b.state === "OUTSIDE") {
+        acc.copy(center).sub(m.position).normalize().multiplyScalar(2.5);
+      } else if (b.state === "INSIDE") {
+        let baseAngle = Math.atan2(b.vel.y, b.vel.x);
+        let randOffset = (Math.random() - 0.5) * Math.PI * 1.6;
+        let targetAngle = baseAngle + randOffset;
+        acc
+          .set(Math.cos(targetAngle), Math.sin(targetAngle))
+          .multiplyScalar(0.45);
+      } else if (b.state === "ESCAPING") {
+        acc.copy(center).sub(m.position).normalize().multiplyScalar(0.9);
+      }
+    } else {
+      // 方块：以各自方块中心吸引
+      b.containerMesh.getWorldPosition(tmpV3);
+      const cx = tmpV3.x,
+        cy = tmpV3.y;
+
+      if (b.state === "OUTSIDE") {
+        acc
+          .set(cx - m.position.x, cy - m.position.y)
+          .normalize()
+          .multiplyScalar(2.5);
+      } else if (b.state === "INSIDE") {
+        let baseAngle = Math.atan2(b.vel.y, b.vel.x);
+        let randOffset = (Math.random() - 0.5) * Math.PI * 1.6;
+        let targetAngle = baseAngle + randOffset;
+        acc
+          .set(Math.cos(targetAngle), Math.sin(targetAngle))
+          .multiplyScalar(0.6);
+      } else if (b.state === "ESCAPING") {
+        acc
+          .set(cx - m.position.x, cy - m.position.y)
+          .normalize()
+          .multiplyScalar(0.9);
+      }
+
+      // 同步球到其方块 shader（世界坐标）
+      const mat = b.containerMesh.material;
+      mat.uniforms.uLightPos.value[0].set(m.position.x, m.position.y);
+      mat.uniforms.uLightColor.value[0].copy(b.color);
     }
 
     // 速度积分 & 阻尼/限速
     b.vel.add(acc.multiplyScalar(dt));
     b.vel.multiplyScalar(0.995);
     const speed = b.vel.length();
-    if (speed > MAX_SPEED) b.vel.multiplyScalar(MAX_SPEED / speed);
-    if (speed < MIN_SPEED) {
+    if (speed > 0.5) b.vel.multiplyScalar(0.5 / speed);
+    if (speed < 0.05) {
       const ang = Math.random() * Math.PI * 2;
-      b.vel.set(Math.cos(ang), Math.sin(ang)).multiplyScalar(MIN_SPEED);
+      b.vel.set(Math.cos(ang), Math.sin(ang)).multiplyScalar(0.05);
     }
 
     m.position.x += b.vel.x * dt;
     m.position.y += b.vel.y * dt;
   }
 
-  // ★ 改成所有球都喂给 shader
-  const contributors = balls.slice(0, MAX_LIGHTS);
-  const n = contributors.length;
-  glassUniforms.uLightCount.value = n;
+  // 六边形形态：把在六边形内的球喂给统一 shader
+  if (hexMesh) {
+    const trapped = balls.filter((b) =>
+      pointInConvexPolygon(
+        new THREE.Vector2(b.mesh.position.x, b.mesh.position.y)
+      )
+    );
+    const n = Math.min(trapped.length, MAX_LIGHTS);
+    glassUniforms.uLightCount.value = n;
+    glassUniforms.uIntensity.value = 0.75 / Math.pow(Math.max(1, n), 0.3);
 
-  // 灯数越多，整体强度自动缩放
-  glassUniforms.uIntensity.value = 0.75 / Math.pow(Math.max(1, n), 0.3);
-
-  for (let i = 0; i < n; i++) {
-    const b = contributors[i];
-    glassUniforms.uLightPos.value[i].set(b.mesh.position.x, b.mesh.position.y);
-    glassUniforms.uLightColor.value[i].copy(b.color);
+    for (let i = 0; i < n; i++) {
+      const b = trapped[i];
+      glassUniforms.uLightPos.value[i].set(
+        b.mesh.position.x,
+        b.mesh.position.y
+      );
+      glassUniforms.uLightColor.value[i].copy(b.color);
+    }
   }
 
   renderer.render(scene, camera);
 }
+
 animate();
 
-let l = ["北京", "周末", "爱运动", "小吃", "四大名著"];
-let idx = 0;
-// === Keyboard: press 'A' to add a hardcoded keyword ball ===
-window.addEventListener("keydown", (e) => {
-  if (e.key.toLowerCase() === "a") {
-    spawnKeywordBall(l[idx]);
-    idx = (idx + 1) % l.length;
-  }
-  if (e.key.toLowerCase() === "b") {
-    breatheHex(); // 也可传参定制：breatheHex({ scaleUp: 1.08, repeats: 3 })
-  }
-});
+//
+//
+//
+//
+//
+//
+//
+//
 
 let isRefresh = false;
-let addedKW = [];
+// const caption = document.getElementById("caption");
 const textWS = new WebSocket("ws://localhost:8000/ws/text");
 textWS.onopen = () => textWS.send("ping"); // 可选
 textWS.onmessage = (ev) => {
   const data = JSON.parse(ev.data); // { event, text, keywords, timestamp }
+  console.log("文本:", data.text, "关键词:", data.keywords);
+  // caption.innerHTML = highlightText(data.text, data.keywords || []);
+
   const list = Array.isArray(data.keywords) ? data.keywords : [];
   for (const raw of list) {
     const kw = (raw || "").trim();
-    if (!kw || kw === "豆包" || addedKW.includes(kw)) continue;
-    spawnKeywordBall(kw);
-  }
-
-  for (let elem of list) {
-    if (!addedKW.includes(elem)) {
-      addedKW.push(elem);
+    if (!kw || kw == "豆包") continue;
+    const key = kw.toLowerCase();
+    if (seenKeywords.has(key)) {
+      // 已经有这个词：可选做个“呼吸”提示（不需要就忽略）
+      // const i = balls.length - 1; // 或根据你的映射找到具体球
+      continue;
     }
+    seenKeywords.add(key);
+    // spawnKeywordAsBallAtRing(kw);
   }
 };
 
@@ -632,6 +473,9 @@ async function pollBackendStatus() {
       currentEventId = eventId;
       handleEvent(eventId, data.text);
     }
+    if (eventId == 999) {
+    } else if (eventId == 352) {
+    }
   } catch (error) {
     console.error("获取后端状态失败:", error);
   }
@@ -639,11 +483,6 @@ async function pollBackendStatus() {
 
 function handleEvent(eventId, text) {
   console.log("切换状态:", eventId, "识别文本:", text);
-  if (eventId == 999) {
-    idleFactor = 0.4;
-  } else if (eventId == 352 || eventId == 359) {
-    idleFactor = 1.0;
-  }
 }
 
 // 每 100ms 轮询一次
@@ -755,7 +594,7 @@ setTimeout(() => {
       console.error("❌ 自动 Stop 请求失败:", err);
       window.location.href = "/thankyou.html"; // 或你的主页/提示页
     });
-}, 20 * 60 * 1000); // 60秒
+}, 5 * 60 * 1000); // 60秒
 
 window.addEventListener("unload", () => {
   if (!isRefresh) {
