@@ -45,7 +45,8 @@ let NOISE_MAG = 0.35; // 随机扰动强度
 const MAX_SPEED = 0.5;
 const MIN_SPEED = 0.05;
 
-let idleFactor = 0.4;
+let idleFactor = 0.5;
+let useRMS = false;
 
 // 黄金角分布（入场角度更均匀）
 let goldenIdx = 0;
@@ -93,6 +94,27 @@ const glassUniforms = {
   uHexFeather: { value: 0.006 }, // ★ 新增：边缘羽化宽度（世界单位）
 };
 
+// 扇贝圆参数（规则、平均）
+Object.assign(glassUniforms, {
+  uBaseRadius: { value: HEX_RADIUS }, // 基准半径 R0
+  uFeather: { value: 0.006 }, // 形状边缘羽化（世界单位）
+  uAmpFrac: { value: 0.14 }, // 扇贝振幅比例 0~0.3
+  uK: { value: 3 }, // 波峰数（建议 6~10）
+  uPhase: { value: 0.0 }, // 相位（可做慢速旋转）
+});
+
+// 描边参数（就在 bodyMesh 的同一 shader 里画）
+Object.assign(glassUniforms, {
+  uEdgeWidth: { value: 0.014 }, // 描边厚度（世界单位，沿形状内侧）
+  uEdgeFeather: { value: 0.006 }, // 描边软化
+  uEdgeColor: { value: new THREE.Color(0xffffff) }, // 描边颜色
+  uEdgeAlpha: { value: 0.6 }, // 描边不透明度
+});
+
+// 不再用六边形那两个
+delete glassUniforms.uHexApothem;
+delete glassUniforms.uHexFeather;
+
 const glassMat = new THREE.ShaderMaterial({
   transparent: true,
   depthWrite: false,
@@ -106,80 +128,152 @@ const glassMat = new THREE.ShaderMaterial({
     }
   `,
   fragmentShader: /* glsl */ `
-    varying vec2 vWorld;
-    uniform int   uLightCount;
-    uniform vec2  uLightPos[${MAX_LIGHTS}];
-    uniform vec3  uLightColor[${MAX_LIGHTS}];
-    uniform float uRadiusWorld;
-    uniform float uIntensity;
-    uniform float uGrainScale;
-    uniform float uGrainAmount;
-    uniform float uAlpha;
-    uniform float uHexApothem; // 六边形内切半径（世界单位）
-    uniform float uHexFeather; // 边缘羽化宽度（世界单位）
-    float sdHex(vec2 p, float r) {
-      p = abs(p);
-      return max(dot(p, vec2(0.8660254, 0.5)), p.x) - r;
-    }
+varying vec2 vWorld;
+uniform int   uLightCount;
+uniform vec2  uLightPos[${MAX_LIGHTS}];
+uniform vec3  uLightColor[${MAX_LIGHTS}];
+uniform float uRadiusWorld;
+uniform float uIntensity;
+uniform float uGrainScale;
+uniform float uGrainAmount;
+uniform float uAlpha;
 
-    float hash(vec2 p){return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453);}
-    float noise(vec2 p){
-      vec2 i=floor(p), f=fract(p);
-      float a=hash(i), b=hash(i+vec2(1.,0.));
-      float c=hash(i+vec2(0.,1.)), d=hash(i+vec2(1.,1.));
-      vec2 u=f*f*(3.-2.*f);
-      return mix(a,b,u.x)+(c-a)*u.y*(1.-u.x)+(d-b)*u.x*u.y;
-    }
+// 规则扇贝圆参数
+uniform float uBaseRadius; // R0
+uniform float uFeather;    // 形状羽化宽度（世界单位）
+uniform float uAmpFrac;    // 振幅比例
+uniform float uK;          // 波峰数
+uniform float uPhase;      // 相位（可用于缓慢旋转）
 
-    void main(){
-      vec3 accum = vec3(0.0);
-      float sumFall = 0.0;
+// 内描边（同一个 mesh 上画）
+uniform float uEdgeWidth;
+uniform float uEdgeFeather;
+uniform vec3  uEdgeColor;
+uniform float uEdgeAlpha;
 
-      // ★ 六边形掩膜：inside≈1，outside≈0，边缘平滑过渡
-      float dHex = sdHex(vWorld, uHexApothem);
-      float hexMask = smoothstep(uHexFeather, 0.0, dHex);
+float hash(vec2 p){return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453);}
+float noise(vec2 p){
+  vec2 i=floor(p), f=fract(p);
+  float a=hash(i), b=hash(i+vec2(1.,0.));
+  float c=hash(i+vec2(0.,1.)), d=hash(i+vec2(1.,1.));
+  vec2 u=f*f*(3.-2.*f);
+  return mix(a,b,u.x)+(c-a)*u.y*(1.-u.x)+(d-b)*u.x*u.y;
+}
 
-      for (int i=0; i<${MAX_LIGHTS}; i++){
-        if (i>=uLightCount) break;
-        float dist = length(vWorld - uLightPos[i]);
-        float g = (noise(vWorld * uGrainScale + float(i)*13.37) - 0.5) * uGrainAmount;
-        dist += g;
+void main(){
+  // 极坐标
+  float r  = length(vWorld);
+  float th = atan(vWorld.y, vWorld.x);
 
-        float fall = smoothstep(uRadiusWorld, 0.0, dist);
-        fall = pow(fall, 1.35);
+  // 规则“扇贝圆”半径：R(θ)=R0*(1 + a·cos(kθ+φ))
+  float Rth = uBaseRadius * (1.0 + uAmpFrac * cos(uK * th + uPhase));
 
-        // ★ 只在六边形内部生效
-        fall *= hexMask;
+  // 距离带符号：外部为正，内部为负
+  float d = r - Rth;
 
-        accum += uLightColor[i] * fall;
-        sumFall += fall;
-      }
+  // ★★ 硬裁剪：形状外面直接丢弃像素（完全不写颜色/alpha）
+  if (d > uFeather) { discard; }
 
-      vec3 color = accum * uIntensity;
-      float alpha = clamp(sumFall, 0.0, 1.0) * uAlpha;
-      gl_FragColor = vec4(color, alpha);
-    }
+  // 软掩膜：inside→1, edge→平滑过渡
+  // 这条写法方向明确：r < Rth - feather 时≈1；r > Rth + feather 时≈0
+  float mask = smoothstep(Rth + uFeather, Rth - uFeather, r);
+
+  // === 发光只在形状内部 ===
+  vec3 accum = vec3(0.0);
+  float sumFall = 0.0;
+  for (int i=0; i<${MAX_LIGHTS}; i++){
+    if (i>=uLightCount) break;
+    float dist = length(vWorld - uLightPos[i]);
+    float g = (noise(vWorld * uGrainScale + float(i)*13.37) - 0.5) * uGrainAmount;
+    dist += g;
+
+    float fall = smoothstep(uRadiusWorld, 0.0, dist);
+    fall = pow(fall, 1.35);
+
+    fall *= mask; // ★ 仅内部有效
+    accum += uLightColor[i] * fall;
+    sumFall += fall;
+  }
+
+  // 内部颜色/透明度（乘 mask，进一步确保外面为 0）
+  vec3  innerColor = accum * uIntensity;
+  float innerAlpha = mask * clamp(sumFall, 0.0, 1.0) * uAlpha;
+
+  // === 内描边：沿内侧，厚度 uEdgeWidth ===
+  float t = -d; // 内侧距离（>0 表示在内部）
+  float edgeBand = smoothstep(0.0, uEdgeFeather, t)
+                 * (1.0 - smoothstep(uEdgeWidth, uEdgeWidth + uEdgeFeather, t));
+  edgeBand *= mask; // 只在内部
+
+  vec3  edgeCol = uEdgeColor * edgeBand;
+  float edgeAlp = uEdgeAlpha * edgeBand;
+
+  // 合成
+  vec3  finalColor = innerColor + edgeCol;
+  float finalAlpha = max(innerAlpha, edgeAlp);
+
+  gl_FragColor = vec4(finalColor, finalAlpha);
+}
+
+
   `,
 });
 
+glassUniforms.uEdgeWidth.value = 0.0; // 厚度为 0
+glassUniforms.uEdgeAlpha.value = 0.0; // 完全透明
+
 const backMat = new THREE.MeshBasicMaterial({ color: 0x090909 });
 
-// 六边形 Mesh
-let hexMesh = null;
-let backMesh = null;
+const bodyGeo = new THREE.CircleGeometry(0.6, 256);
+let bodyMesh = null,
+  backMesh = null;
 
-function ensureHexMeshes() {
-  if (!hexMesh) hexMesh = new THREE.Mesh(hexGeo, glassMat);
+function ensureBodyMeshes() {
+  if (!bodyMesh) bodyMesh = new THREE.Mesh(bodyGeo, glassMat);
   if (!backMesh) {
-    backMesh = new THREE.Mesh(hexGeo, backMat);
+    backMesh = new THREE.Mesh(bodyGeo, backMat);
     backMesh.position.z = -0.01;
   }
 }
+ensureBodyMeshes();
+scene.add(bodyMesh);
+// scene.add(backMesh);
 
-// 初始化即添加 HEX 容器
-ensureHexMeshes();
-scene.add(hexMesh);
-scene.add(backMesh);
+// === 扇贝“顶点/边”数量按萤火虫数自动更新 ===
+const MIN_LOBES = 2; // 最少的“顶点/边”数（你要更规则就 ≥6）
+const MAX_LOBES = 24; // 上限，防止过密
+let lastLobeK = glassUniforms.uK.value;
+
+// 让幅度随 k 略衰减：k 多时波峰不会显得过炸
+function ampCompensationForK(k, baseAmp = 0.14, refK = 8, gamma = 0.6) {
+  // 经验：a(k) = baseAmp * (refK / k)^gamma
+  return baseAmp * Math.pow(refK / Math.max(1, k), gamma);
+}
+
+function updateBodyLobesByBallCount() {
+  const count = Math.max(1, balls.length); // 或者用 contributors.length
+  const targetK = Math.max(MIN_LOBES, Math.min(MAX_LOBES, MIN_LOBES + count));
+
+  if (targetK !== lastLobeK) {
+    // 平滑过渡 k / 幅度，避免“弹跳”
+    gsap.to(glassUniforms.uK, {
+      value: targetK,
+      duration: 0.35,
+      ease: "power2.inOut",
+    });
+    gsap.to(glassUniforms.uAmpFrac, {
+      value: ampCompensationForK(
+        targetK,
+        /*baseAmp=*/ 0.14,
+        /*refK=*/ 8,
+        /*gamma=*/ 0.6
+      ),
+      duration: 0.35,
+      ease: "power2.inOut",
+    });
+    lastLobeK = targetK;
+  }
+}
 
 // === Hex collision (point-in-hex) ===
 const hexVerts = [];
@@ -200,6 +294,19 @@ function pointInConvexPolygon(p) {
   return true;
 }
 
+function radiusAtWavyJS(theta) {
+  const R0 = glassUniforms.uBaseRadius.value;
+  const a = glassUniforms.uAmpFrac.value;
+  const k = glassUniforms.uK.value;
+  const ph = glassUniforms.uPhase.value;
+  return R0 * (1 + a * Math.cos(k * theta + ph));
+}
+function pointInsideWavy(p) {
+  const r = Math.hypot(p.x, p.y);
+  const th = Math.atan2(p.y, p.x);
+  return r <= radiusAtWavyJS(th);
+}
+
 function nextPow2(x) {
   return Math.pow(2, Math.ceil(Math.log2(Math.max(1, x))));
 }
@@ -214,32 +321,56 @@ function pixelsToWorldHeight(px) {
 let breatheTl = null;
 
 function breatheHex({
-  scaleUp = 1.03, // 轻微放大幅度
+  scaleUp = 1.03, // 放大倍率
   oneBeat = 0.18, // 单次起伏时长
-  repeats = 2, // 呼吸次数（两次）
+  repeats = 2, // 呼吸次数
   ease = "power2.inOut",
+  edgeFollowsScale = false, // =true 时描边厚度也随规模变
 } = {}) {
-  // 如果上一次还在播，重启
+  // 停掉上一次
   if (breatheTl) {
     breatheTl.kill();
     breatheTl = null;
   }
 
-  // 用代理值驱动缩放，同时同步 uRadiusWorld
+  // 记录当前基线，避免多次调用累计漂移
+  const baseR = glassUniforms.uBaseRadius.value;
+  const baseFall = glassUniforms.uRadiusWorld.value;
+  const baseEW = glassUniforms.uEdgeWidth?.value ?? 0.014;
+  const baseEF = glassUniforms.uEdgeFeather?.value ?? 0.006;
+
   const proxy = { s: 1.0 };
 
   breatheTl = gsap.timeline({
     defaults: { duration: oneBeat, ease },
     onUpdate: () => {
       const s = proxy.s;
-      if (hexMesh) hexMesh.scale.setScalar(s);
-      if (backMesh) backMesh.scale.setScalar(s);
-      // 半径随缩放同步，保持光晕衰减逻辑一致
-      // glassUniforms.uRadiusWorld.value = HEX_RADIUS * s;
+      // ★ 直接改“形状半径”，让扇贝圆本体呼吸
+      glassUniforms.uBaseRadius.value = baseR * s;
+      // ★ 同步光衰减半径，保持亮斑尺度一致
+      glassUniforms.uRadiusWorld.value = baseFall * s;
+
+      // 可选：描边厚度也随体积变化
+      if (edgeFollowsScale) {
+        if (glassUniforms.uEdgeWidth)
+          glassUniforms.uEdgeWidth.value = baseEW * s;
+        if (glassUniforms.uEdgeFeather)
+          glassUniforms.uEdgeFeather.value = baseEF * s;
+      }
+    },
+    onComplete: () => {
+      // 结束时精确回到基线，避免浮点误差
+      glassUniforms.uBaseRadius.value = baseR;
+      glassUniforms.uRadiusWorld.value = baseFall;
+      if (edgeFollowsScale) {
+        if (glassUniforms.uEdgeWidth) glassUniforms.uEdgeWidth.value = baseEW;
+        if (glassUniforms.uEdgeFeather)
+          glassUniforms.uEdgeFeather.value = baseEF;
+      }
     },
   });
 
-  // 一个“呼吸”= 放大->缩回
+  // 一个“呼吸”= 放大 -> 缩回
   for (let i = 0; i < repeats; i++) {
     breatheTl.to(proxy, { s: scaleUp }).to(proxy, { s: 1.0 });
   }
@@ -404,6 +535,9 @@ function spawnKeywordBall(kw) {
         textSprite.material.map?.dispose?.();
         textSprite.material.dispose();
         textSprite.geometry?.dispose?.();
+
+        // ★ 新增：按当前球的数量更新“顶点/边”数
+        updateBodyLobesByBallCount();
       },
     },
     "A_end-=0.2"
@@ -417,19 +551,38 @@ function animate() {
   requestAnimationFrame(animate);
   const dt = clock.getDelta();
 
+  if (useRMS) {
+    const rawRms = measureRMS();
+    // 门限&归一化
+    const norm = Math.max(0, rawRms - RMS_NOISE_FLOOR) / RMS_FULL_SCALE;
+    const target = Math.min(1, norm);
+
+    // 指数平滑（时间常数跟随 dt）
+    const smoothAlpha = 1 - Math.exp(-6 * dt); // 6 可调，越大响应越快
+    rmsSmooth += (target - rmsSmooth) * smoothAlpha;
+
+    // 把平滑 RMS 映射成缩放系数：s ∈ [1, 1 + RMS_MAX_GAIN]
+    const s = 1 + rmsSmooth * RMS_MAX_GAIN;
+
+    // 同步半径与光衰半径，等价“呼吸”
+    glassUniforms.uBaseRadius.value = BASE_R0 * s;
+    glassUniforms.uRadiusWorld.value = BASE_FALLOFF * s;
+  }
+
+  const contributors = balls.slice(0, MAX_LIGHTS); // 仍用于光源、与形状无关
+
   for (const b of balls) {
     const m = b.mesh;
 
-    // 六边形内外判定（世界坐标）
+    // ★ 新判定：规则扇贝圆
     const pos2 = new THREE.Vector2(m.position.x, m.position.y);
-    const inside = pointInConvexPolygon(pos2);
+    const inside = pointInsideWavy(pos2);
 
-    // 简化状态：OUTSIDE/INSIDE/ESCAPING
     if (b.state === "OUTSIDE" && inside) b.state = "INSIDE";
     else if (b.state === "INSIDE" && !inside) b.state = "ESCAPING";
     else if (b.state === "ESCAPING" && inside) b.state = "INSIDE";
 
-    // 力/加速度（六边形模式）
+    // 力学同原先
     const acc = new THREE.Vector2();
     if (b.state === "OUTSIDE") {
       acc
@@ -439,14 +592,13 @@ function animate() {
         .multiplyScalar(2.5)
         .multiplyScalar(idleFactor);
     } else if (b.state === "INSIDE") {
-      // 旧感觉：仅随机游走（不加常驻向心）
       const baseAngle = Math.atan2(b.vel.y, b.vel.x);
       const randOffset = (Math.random() - 0.5) * Math.PI * 1.6;
       const targetAngle = baseAngle + randOffset;
       acc
         .set(Math.cos(targetAngle), Math.sin(targetAngle))
         .multiplyScalar(0.45)
-        .multiplyScalar(idleFactor); // 随机游走强度（可微调 0.35~0.55）
+        .multiplyScalar(idleFactor);
     } else if (b.state === "ESCAPING") {
       acc
         .copy(center)
@@ -456,7 +608,6 @@ function animate() {
         .multiplyScalar(idleFactor);
     }
 
-    // 速度积分 & 阻尼/限速
     b.vel.add(acc.multiplyScalar(dt));
     b.vel.multiplyScalar(0.995);
     const speed = b.vel.length();
@@ -470,14 +621,10 @@ function animate() {
     m.position.y += b.vel.y * dt;
   }
 
-  // ★ 改成所有球都喂给 shader
-  const contributors = balls.slice(0, MAX_LIGHTS);
+  // 喂给 Shader（保持不变）
   const n = contributors.length;
   glassUniforms.uLightCount.value = n;
-
-  // 灯数越多，整体强度自动缩放
   glassUniforms.uIntensity.value = 0.75 / Math.pow(Math.max(1, n), 0.3);
-
   for (let i = 0; i < n; i++) {
     const b = contributors[i];
     glassUniforms.uLightPos.value[i].set(b.mesh.position.x, b.mesh.position.y);
@@ -486,6 +633,7 @@ function animate() {
 
   renderer.render(scene, camera);
 }
+
 animate();
 
 let l = ["北京", "周末", "爱运动", "小吃", "四大名著"];
@@ -563,6 +711,28 @@ audioSocket.onmessage = async (event) => {
   playFromQueue();
 };
 
+// === RMS 驱动参数（可按需微调） ===
+const BASE_R0 = glassUniforms.uBaseRadius.value;
+const BASE_FALLOFF = glassUniforms.uRadiusWorld.value;
+
+// 为了显示更平滑，做指数平滑
+let rmsSmooth = 0;
+// 噪声门限（静音/底噪抑制）
+const RMS_NOISE_FLOOR = 0.015; // 抑制底噪
+const RMS_FULL_SCALE = 0.12; // 中等灵敏度
+const RMS_MAX_GAIN = 0.25; // 最大放大 25%
+
+// 读取 analyserNode 的时域数据并计算 RMS
+function measureRMS() {
+  analyserNode.getFloatTimeDomainData(audioDataArray);
+  let sum = 0;
+  for (let i = 0; i < audioDataArray.length; i++) {
+    const v = audioDataArray[i];
+    sum += v * v;
+  }
+  return Math.sqrt(sum / audioDataArray.length);
+}
+
 document.body.addEventListener(
   "click",
   () => {
@@ -606,7 +776,7 @@ function playFromQueue() {
     isPlaying = false;
     // 如果队列里还有，继续下一段；否则停掉 VAD
     if (playQueue.length === 0) {
-      stopPlaybackVAD();
+      // stopPlaybackVAD();
     }
     playFromQueue();
   };
@@ -640,9 +810,11 @@ async function pollBackendStatus() {
 function handleEvent(eventId, text) {
   console.log("切换状态:", eventId, "识别文本:", text);
   if (eventId == 999) {
-    idleFactor = 0.4;
+    idleFactor = 0.14;
+    useRMS = false;
   } else if (eventId == 352 || eventId == 359) {
     idleFactor = 1.0;
+    useRMS = true;
   }
 }
 
